@@ -1,0 +1,13 @@
+[project]
+name = "r2-consumer"
+version = "0.1.0"
+description = "Cloudflare R2 event-notification queue consumer"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.42.79",
+    "requests>=2.32",
+]
+
+[project.scripts]
+r2-consumer = "r2_consumer:main"
