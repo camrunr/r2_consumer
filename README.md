@@ -80,6 +80,8 @@ Each stdout line is a self-contained JSON record:
 
 ## Cribl Script Collector Setup
 
+NOTE You should run it once manually without the --no-skip option to validate queue set-up and permissions!
+
 ### Discovery run
 ```
 python3 r2_consumer.py --no-setup
