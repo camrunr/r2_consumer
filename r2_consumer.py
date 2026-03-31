@@ -526,10 +526,16 @@ def main() -> None:
 
     validate_config()
 
-    # Fetch mode: RECORD positional arg supplied — download + ack, then exit.
-    if args.record is not None:
+    # CRIBL_COLLECT_ARG env var acts as an implicit RECORD argument, allowing
+    # the script to be driven in fetch mode by a Cribl collector without
+    # requiring explicit CLI construction.
+    raw_record = args.record if args.record is not None else os.environ.get("CRIBL_COLLECT_ARG")
+
+    # Fetch mode: RECORD positional arg supplied (or CRIBL_COLLECT_ARG set) —
+    # download + ack, then exit.
+    if raw_record is not None:
         try:
-            record = json.loads(args.record)
+            record = json.loads(raw_record)
         except json.JSONDecodeError as exc:
             print(f"ERROR: RECORD is not valid JSON: {exc}", file=sys.stderr)
             sys.exit(1)

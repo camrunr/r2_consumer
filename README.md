@@ -12,13 +12,10 @@ entries are acknowledged.
 mode, downloads the referenced object, writes its bytes to stdout, then
 acknowledges the queue entry to permanently remove it.
 
-```bash
-# Step 1 — collect work (one JSON line per object):
-python3 r2_consumer.py > records.jsonl
+This is in support of Cribl Stream's Discover/Collect workflow. The Discovery 
+step expects the output of the list mode. Then each "item" in the list will be 
+handed off to the Collect step to be distributed across all your workers.
 
-# Step 2 — distribute fetch across 8 parallel workers:
-cat records.jsonl | parallel -j8 python3 r2_consumer.py {}
-```
 
 ## How it works
 
@@ -59,6 +56,7 @@ uv add requests boto3
 | `R2_ACCESS_KEY_ID` | yes | R2 S3-compatible access key ID |
 | `R2_SECRET_ACCESS_KEY` | yes | R2 S3-compatible secret access key |
 | `QUEUE_NAME` | no | Queue name — defaults to `<BUCKET_NAME>-notifications` |
+| `CRIBL_COLLECT_ARG` | no | JSON record (same format as the `RECORD` positional arg). When set, the script runs in fetch mode automatically without a CLI argument. |
 
 ## Usage
 
@@ -80,7 +78,25 @@ Each stdout line is a self-contained JSON record:
 {"queue_id":"ed0e359b...","lease_id":"eyJhbGci...","bucket":"my-bucket","key":"logs/2024-01-01.log.gz","action":"PutObject"}
 ```
 
-### Fetch mode (RECORD arg)
+## Cribl Script Collector Setup
+
+### Discovery run
+```
+python3 r2_consumer.py --no-setup
+```
+
+### Collect step
+```
+python3 r2_consumer.py --no-setup
+```
+This step will use the environment variable CRIBL_COLLECT_ARG resulting from 
+the Discover step above.
+
+### Required environment variables
+Create ENV vars for the required list above
+
+
+### Fetch mode (RECORD arg or CRIBL_COLLECT_ARG)
 
 Pass a JSON record from list mode as a positional argument.  The script
 downloads the object, writes its bytes to stdout, then acknowledges the queue
@@ -89,6 +105,18 @@ entry so it is permanently removed.
 ```bash
 python3 r2_consumer.py '{"queue_id":"...","lease_id":"...","bucket":"...","key":"..."}'
 ```
+
+Alternatively, set `CRIBL_COLLECT_ARG` to the JSON record.  This is
+equivalent to passing it on the CLI and is useful when the script is invoked
+by a Cribl collector or another orchestrator that injects arguments via
+environment variables:
+
+```bash
+export CRIBL_COLLECT_ARG='{"queue_id":"...","lease_id":"...","bucket":"...","key":"..."}'
+python3 r2_consumer.py
+```
+
+The CLI argument takes precedence if both are supplied.
 
 ### Distributed pipeline
 
