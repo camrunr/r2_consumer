@@ -78,26 +78,6 @@ Each stdout line is a self-contained JSON record:
 {"queue_id":"ed0e359b...","lease_id":"eyJhbGci...","bucket":"my-bucket","key":"logs/2024-01-01.log.gz","action":"PutObject"}
 ```
 
-## Cribl Script Collector Setup
-
-NOTE You should run it once manually without the --no-skip option to validate queue set-up and permissions!
-
-### Discovery run
-```
-python3 r2_consumer.py --no-setup
-```
-
-### Collect step
-```
-python3 r2_consumer.py --no-setup
-```
-This step will use the environment variable CRIBL_COLLECT_ARG resulting from 
-the Discover step above.
-
-### Required environment variables
-Create ENV vars for the required list above
-
-
 ### Fetch mode (RECORD arg or CRIBL_COLLECT_ARG)
 
 Pass a JSON record from list mode as a positional argument.  The script
@@ -177,6 +157,26 @@ If the object is binary, redirect stdout to a file:
 ```bash
 python3 r2_consumer.py > output.bin
 ```
+
+## Cribl Script Collector Setup
+
+NOTE You should run it once manually without the --no-skip option to validate queue set-up and permissions!
+
+### Discovery run
+```
+python3 r2_consumer.py --no-setup
+```
+
+### Collect step
+```
+python3 r2_consumer.py --no-setup
+```
+This step will use the environment variable CRIBL_COLLECT_ARG resulting from 
+the Discover step above.
+
+### Required environment variables
+Create ENV vars for the required list above
+
 
 ## API token permissions
 
