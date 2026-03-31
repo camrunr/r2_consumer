@@ -255,23 +255,22 @@ def download_object(r2: Any, bucket: str, key: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Pull loop: consume messages, download objects, ack on success
+# Pull loop: emit one JSON record per queued message (no download, no ack)
 # ---------------------------------------------------------------------------
 
-def pull_and_process(queue_id: str, r2: Any) -> int:
-    """Pull one batch of messages, process each, ack successes.
+def pull_and_list(queue_id: str) -> int:
+    """Pull one batch of messages and print each as a JSON line to stdout.
 
-    Returns the number of messages successfully processed.
+    Each line contains all fields a fetch worker needs to download the object
+    and acknowledge the message independently:
+      queue_id, lease_id, bucket, key, action
 
-    Processing order for each message (critical for single-delivery):
-      1. Decode the queue message body.
-      2. Download the R2 object referenced by the notification.
-      3. Write the object bytes to stdout.
-      4. Add the lease_id to the ack list.
-    Only after ALL steps succeed is the lease_id included in the ack call.
+    Does NOT download objects or acknowledge messages — that is left to a
+    separate fetch worker (see fetch_and_ack).  Returns the number of records
+    printed.
     """
-    # Pull up to PULL_BATCH_SIZE messages; Cloudflare short-polls — if there
-    # are no messages it returns an empty batch immediately rather than blocking.
+    # Cloudflare short-polls: returns an empty batch immediately when the
+    # queue has no messages rather than blocking.
     print(
         f"[pull] pulling up to {PULL_BATCH_SIZE} messages "
         f"(visibility_timeout={VISIBILITY_TIMEOUT_MS}ms) ...",
@@ -292,8 +291,7 @@ def pull_and_process(queue_id: str, r2: Any) -> int:
 
     print(f"[pull] received {len(messages)} message(s)", file=sys.stderr)
 
-    ack_lease_ids: list[str] = []
-
+    count = 0
     for msg in messages:
         lease_id = msg["lease_id"]
         raw_body = msg["body"]
@@ -310,7 +308,6 @@ def pull_and_process(queue_id: str, r2: Any) -> int:
             notification = json.loads(decoded)
         except json.JSONDecodeError:
             print(f"[pull] WARN: non-JSON message body, skipping: {decoded!r}", file=sys.stderr)
-            # Do not ack — let it expire and potentially surface for investigation.
             continue
 
         bucket = notification.get("bucket", BUCKET_NAME)
@@ -321,40 +318,59 @@ def pull_and_process(queue_id: str, r2: Any) -> int:
             print(f"[pull] WARN: notification has no object.key — skipping: {notification}", file=sys.stderr)
             continue
 
-        print(f"[pull] downloading s3://{bucket}/{key} (action={action}) ...", file=sys.stderr)
+        # Emit one compact JSON line to stdout. This is the unit of work
+        # passed to a fetch worker: it carries everything needed to download
+        # the object and ack the queue entry without any shared state.
+        record = {
+            "queue_id": queue_id,
+            "lease_id": lease_id,
+            "bucket": bucket,
+            "key": key,
+            "action": action,
+        }
+        print(json.dumps(record, separators=(",", ":")))
+        count += 1
 
-        try:
-            # Download the object from R2 using the S3-compatible credentials.
-            data = download_object(r2, bucket, key)
-        except Exception as exc:
-            print(f"[pull] ERROR downloading {key}: {exc}", file=sys.stderr)
-            # Do not ack; the message will be redelivered after visibility_timeout.
-            continue
+    return count
 
-        try:
-            # Write raw bytes to stdout — separate from stderr diagnostics.
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
-        except Exception as exc:
-            print(f"[pull] ERROR writing to stdout for {key}: {exc}", file=sys.stderr)
-            continue
 
-        print(f"[pull] wrote {len(data)} bytes for {key}", file=sys.stderr)
-        # Queue the lease_id for acknowledgment only after a successful write.
-        # This is what removes the notification from the queue permanently.
-        ack_lease_ids.append(lease_id)
+# ---------------------------------------------------------------------------
+# Fetch worker: download one object and ack its queue entry
+# ---------------------------------------------------------------------------
 
-    if ack_lease_ids:
-        # Acknowledge all successfully processed messages in a single request.
-        # Each acked lease_id is permanently removed from the queue backlog.
-        print(f"[pull] acknowledging {len(ack_lease_ids)} message(s) ...", file=sys.stderr)
-        _cf_post(
-            f"/accounts/{ACCOUNT_ID}/queues/{queue_id}/messages/ack",
-            {"acks": [{"lease_id": lid} for lid in ack_lease_ids], "retries": []},
-        )
-        print(f"[pull] acknowledged {len(ack_lease_ids)} message(s)", file=sys.stderr)
+def fetch_and_ack(record: dict) -> None:
+    """Download the R2 object described by record, write bytes to stdout, then ack.
 
-    return len(ack_lease_ids)
+    record must contain: queue_id, lease_id, bucket, key.
+    The queue message is acknowledged only after the object has been fully
+    written to stdout, guaranteeing the entry is removed at most once per
+    successful write.  Any exception before the ack leaves the message in
+    the queue to be retried after the visibility timeout.
+    """
+    bucket = record["bucket"]
+    key = record["key"]
+    queue_id = record["queue_id"]
+    lease_id = record["lease_id"]
+
+    print(f"[fetch] downloading s3://{bucket}/{key} ...", file=sys.stderr)
+
+    r2 = make_r2_client()
+    data = download_object(r2, bucket, key)
+
+    # Write raw bytes to stdout — stderr carries all diagnostic output so the
+    # two streams never mix when stdout is redirected or piped.
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+    print(f"[fetch] wrote {len(data)} bytes; acknowledging queue entry ...", file=sys.stderr)
+
+    # Ack only after a successful write — this removes the notification entry
+    # from the queue permanently so no other worker re-processes it.
+    _cf_post(
+        f"/accounts/{ACCOUNT_ID}/queues/{queue_id}/messages/ack",
+        {"acks": [{"lease_id": lease_id}], "retries": []},
+    )
+    print(f"[fetch] acked lease {lease_id[:16]}...", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -460,12 +476,28 @@ def validate_config() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Consume Cloudflare R2 object-create notifications from a Queue.",
+        description=(
+            "Cloudflare R2 event-notification queue consumer.\n\n"
+            "LIST MODE (default): pulls the queue and prints one JSON record per\n"
+            "pending object to stdout. No downloads, no acks.\n\n"
+            "FETCH MODE (RECORD arg): downloads the object in the given JSON record\n"
+            "and acks the queue entry after a successful write."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Set CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, BUCKET_NAME,\n"
             "R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY before running.\n"
             "See README.md for full setup and credential instructions."
+        ),
+    )
+    parser.add_argument(
+        "record",
+        nargs="?",
+        metavar="RECORD",
+        help=(
+            "JSON record emitted by list mode.  When supplied the script runs in\n"
+            "fetch mode: downloads the object, writes it to stdout, and acks the\n"
+            "queue entry.  Omit to run in list mode."
         ),
     )
     parser.add_argument(
@@ -488,11 +520,25 @@ def main() -> None:
     parser.add_argument(
         "--no-setup",
         action="store_true",
-        help="Skip the idempotent setup check and go straight to pulling messages.",
+        help="Skip the idempotent setup check and go straight to listing messages.",
     )
     args = parser.parse_args()
 
     validate_config()
+
+    # Fetch mode: RECORD positional arg supplied — download + ack, then exit.
+    if args.record is not None:
+        try:
+            record = json.loads(args.record)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: RECORD is not valid JSON: {exc}", file=sys.stderr)
+            sys.exit(1)
+        for field in ("queue_id", "lease_id", "bucket", "key"):
+            if field not in record:
+                print(f"ERROR: RECORD is missing required field '{field}'", file=sys.stderr)
+                sys.exit(1)
+        fetch_and_ack(record)
+        return
 
     # --delete-older-than is independent of setup/pull; runs and exits.
     if args.delete_older_than is not None:
@@ -532,9 +578,8 @@ def main() -> None:
         print("[done] setup complete", file=sys.stderr)
         return
 
-    r2 = make_r2_client()
-    processed = pull_and_process(queue_id, r2)
-    print(f"[done] processed {processed} object(s)", file=sys.stderr)
+    count = pull_and_list(queue_id)
+    print(f"[done] listed {count} object(s)", file=sys.stderr)
 
 
 if __name__ == "__main__":

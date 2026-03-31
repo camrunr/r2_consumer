@@ -1,28 +1,41 @@
 # r2-consumer
 
-Connects to the Cloudflare API to monitor an R2 bucket for newly created
-objects via an event-notification queue, downloads each object, and prints
-its uncompressed content to stdout.
+Monitors a Cloudflare R2 bucket for newly created objects via an
+event-notification queue.  The workflow is split into two composable steps
+designed for distributed processing:
 
-On first run the script creates any missing infrastructure (queue, HTTP pull
-consumer, notification rules) before pulling. Subsequent runs skip setup if
-everything is already in place.
+**List mode** (default): pulls the notification queue and prints one JSON
+record per pending object to stdout.  No objects are downloaded; no queue
+entries are acknowledged.
+
+**Fetch mode** (positional `RECORD` arg): accepts a JSON record from list
+mode, downloads the referenced object, writes its bytes to stdout, then
+acknowledges the queue entry to permanently remove it.
+
+```bash
+# Step 1 — collect work (one JSON line per object):
+python3 r2_consumer.py > records.jsonl
+
+# Step 2 — distribute fetch across 8 parallel workers:
+cat records.jsonl | parallel -j8 python3 r2_consumer.py {}
+```
 
 ## How it works
+
+On first run the script sets up any missing infrastructure, then lists:
 
 1. Ensures a Cloudflare Queue exists (creates one if absent).
 2. Ensures an HTTP pull consumer is attached to that queue.
 3. Ensures R2 event notification rules are configured so the bucket emits
    object-create events (`PutObject`, `CopyObject`, `CompleteMultipartUpload`)
    to the queue.
-4. Pulls messages from the queue, downloads each referenced object from R2,
-   writes its bytes to stdout, then acknowledges the message to permanently
-   remove it from the queue.
+4. Pulls messages from the queue and emits one JSON record per object to
+   stdout.
 
 Each notification is processed **at most once**: the queue entry is only
-removed after the object has been fully written to stdout. A failed download
-or write leaves the message unacknowledged; it reappears in the queue after
-the visibility timeout (60 s by default) and can be retried.
+acknowledged (and permanently removed) after the object has been fully written
+to stdout.  A failed download or write leaves the message unacknowledged; it
+reappears in the queue after the visibility timeout (60 s) and can be retried.
 
 ## Dependencies
 
@@ -49,16 +62,72 @@ uv add requests boto3
 
 ## Usage
 
+The script has two primary modes and two utility modes.
+
+### List mode (default)
+
+Pulls the notification queue and prints one JSON line per pending object to
+stdout.  No objects are downloaded; no queue entries are acknowledged.
+
 ```bash
-# Ensure setup then pull all pending notifications (default):
-python3 r2_consumer.py
+python3 r2_consumer.py           # ensure setup, then list
+python3 r2_consumer.py --no-setup  # skip setup, just list
+```
 
-# Only create the queue / consumer / notification rules, do not pull:
+Each stdout line is a self-contained JSON record:
+
+```json
+{"queue_id":"ed0e359b...","lease_id":"eyJhbGci...","bucket":"my-bucket","key":"logs/2024-01-01.log.gz","action":"PutObject"}
+```
+
+### Fetch mode (RECORD arg)
+
+Pass a JSON record from list mode as a positional argument.  The script
+downloads the object, writes its bytes to stdout, then acknowledges the queue
+entry so it is permanently removed.
+
+```bash
+python3 r2_consumer.py '{"queue_id":"...","lease_id":"...","bucket":"...","key":"..."}'
+```
+
+### Distributed pipeline
+
+Because list mode only emits records and fetch mode only consumes one, the two
+steps compose freely.  Use any parallelism tool to fan out the fetch step:
+
+```bash
+# GNU parallel — 8 concurrent fetch workers:
+python3 r2_consumer.py | parallel -j8 python3 r2_consumer.py {}
+
+# xargs:
+python3 r2_consumer.py | xargs -P8 -I{} python3 r2_consumer.py {}
+
+# Save the list first, then distribute across machines or processes:
+python3 r2_consumer.py > records.jsonl
+cat records.jsonl | parallel -j8 python3 r2_consumer.py {}
+```
+
+Diagnostic messages (queue IDs, download progress, errors) go to **stderr**
+and never mix with the JSON records or object bytes on stdout.
+
+If downloaded objects are binary, redirect stdout to a file:
+
+```bash
+python3 r2_consumer.py '{"queue_id":"...","key":"..."}' > output.bin
+```
+
+### Setup only
+
+```bash
 python3 r2_consumer.py --setup-only
+```
 
-# Skip setup and go straight to pulling (queue must already exist):
-python3 r2_consumer.py --no-setup
+Creates the queue, HTTP pull consumer, and R2 notification rules if absent,
+then exits without pulling any messages.
 
+### Delete old objects
+
+```bash
 # Delete all objects in the bucket older than a given age, then exit:
 python3 r2_consumer.py --delete-older-than 1w   # older than 1 week
 python3 r2_consumer.py --delete-older-than 30d  # older than 30 days
