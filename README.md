@@ -17,9 +17,7 @@ step expects the output of the list mode. Then each "item" in the list will be
 handed off to the Collect step to be distributed across all your workers.
 
 
-## How it works
-
-On first run the script sets up any missing infrastructure, then lists:
+## How List works
 
 1. Ensures a Cloudflare Queue exists (creates one if absent).
 2. Ensures an HTTP pull consumer is attached to that queue.
@@ -28,6 +26,16 @@ On first run the script sets up any missing infrastructure, then lists:
    to the queue.
 4. Pulls messages from the queue and emits one JSON record per object to
    stdout.
+
+If you run with `--no-setup` flag, the checks and validations are skipped. It
+will skip directly to grabbing any new objects from the queue (step 4).
+
+## How Collection works
+
+1. When an object is presented on the command line as the last arg, or
+preferably the CRIBL_COLLECT_ARG exists, we go into collect mode
+2. The referenced object will be collected, unpacked, and printed to stdout
+3. Once successfully dumped to stdout, the queue item will be ACK'd
 
 Each notification is processed **at most once**: the queue entry is only
 acknowledged (and permanently removed) after the object has been fully written
