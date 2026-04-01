@@ -170,16 +170,37 @@ python3 r2_consumer.py > output.bin
 
 NOTE You should run it once manually without the --no-skip option to validate queue set-up and permissions!
 
+### Installation 
+
+I installed as the cribl user in the cribl user home directory
+
+* Make an r2_collector directory
+* Put the r2_collector.py script in this directory
+* cd into the dir and `uv init`, then `uv add requests boto3` (or use pip3, venv or other python manager)
+* each Worker in the Worker Group will need these steps complete
+* Optionally test run to validate all the required bits are in place (one time only; not on every worker)
+   * you'll need to set all the env before running (see below)
+   * then `uv run r2_consumer.py`
+```
+export CLOUDFLARE_API_TOKEN=dfat_1234567890lksdlnm
+export CLOUDFLARE_ACCOUNT_ID=abcde0123456789
+export R2_SECRET_ACCESS_KEY=abcde0123456789abcde0123456789abcde0123456789
+export R2_ACCESS_KEY_ID=abcde0123456789abcde0123456789
+export BUCKET_NAME=your_bucket_name
+```
+
+Once you have it installed on all workers proceed into Cribl configs
+
 ### Discovery run
 ```
-python3 r2_consumer.py --no-setup
+(cd ~/r2_consumer; ~/.local/bin/uv run r2_consumer.py --no-setup)
 ```
 
 ### Collect step
 ```
-python3 r2_consumer.py --no-setup
+(cd ~/r2_consumer; ~/.local/bin/uv run r2_consumer.py --no-setup)
 ```
-This step will use the environment variable CRIBL_COLLECT_ARG resulting from 
+This step will use the environment variable CRIBL_COLLECT_ARG that came from 
 the Discover step above.
 
 ### Required environment variables
