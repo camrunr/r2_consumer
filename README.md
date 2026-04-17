@@ -1,4 +1,4 @@
-# r2-consumer
+# r2_consumer
 
 Monitors a Cloudflare R2 bucket for newly created objects via an
 event-notification queue.  The workflow is split into two composable steps

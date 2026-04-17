@@ -5,12 +5,19 @@ import gzip
 import json
 import os
 import re
+import signal
 import sys
+import time
 from typing import Any
 
 import boto3
 import requests
 from botocore.config import Config as BotocoreConfig
+
+# Exit cleanly when stdout is closed early (e.g. piped into `head`) instead of
+# dumping a BrokenPipeError traceback to stderr.
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -21,7 +28,9 @@ ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-QUEUE_NAME = os.environ.get("QUEUE_NAME", f"{BUCKET_NAME}-notifications")
+# QUEUE_NAME is resolved in main() after config validation — otherwise an
+# empty BUCKET_NAME produces the nonsense default "-notifications".
+QUEUE_NAME = ""
 
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 # R2 uses the AWS S3 protocol; credentials come from Manage R2 API Tokens,
@@ -68,61 +77,103 @@ def _cf_raise(resp: requests.Response, method: str, path: str) -> None:
         )
 
 
-def _cf_get(path: str) -> Any:
-    """GET from the Cloudflare v4 API, raise on HTTP or API errors."""
+# Transient failures worth retrying: CF rate-limit + 5xx, plus network errors.
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_MAX_RETRIES = 5
+_BASE_BACKOFF_S = 1.0
+
+
+def _cf_request(method: str, path: str, payload: dict | None = None) -> Any:
+    """Issue a Cloudflare v4 API request with bounded exponential-backoff retry.
+
+    Retries on 429/5xx and network errors up to _MAX_RETRIES times.  Honors
+    Retry-After on 429 when present.  Raises on non-retryable HTTP errors or
+    after retries are exhausted.
+    """
     url = f"{CF_API_BASE}{path}"
-    resp = requests.get(url, headers=_cf_headers(), timeout=30)
-    _cf_raise(resp, "GET", path)
-    body = resp.json()
-    if not body.get("success"):
-        raise RuntimeError(f"API error for GET {path}: {body.get('errors')}")
-    return body
+    kwargs: dict[str, Any] = {"headers": _cf_headers(), "timeout": 30}
+    if payload is not None:
+        kwargs["json"] = payload
+
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == _MAX_RETRIES:
+                raise
+            delay = _BASE_BACKOFF_S * (2 ** attempt)
+            print(
+                f"[retry] {method} {path} network error ({exc}); "
+                f"sleeping {delay:.1f}s (attempt {attempt + 1}/{_MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            continue
+
+        if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else _BASE_BACKOFF_S * (2 ** attempt)
+            except ValueError:
+                delay = _BASE_BACKOFF_S * (2 ** attempt)
+            print(
+                f"[retry] {method} {path} HTTP {resp.status_code}; "
+                f"sleeping {delay:.1f}s (attempt {attempt + 1}/{_MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            continue
+
+        _cf_raise(resp, method, path)
+        body = resp.json()
+        if not body.get("success"):
+            raise RuntimeError(f"API error for {method} {path}: {body.get('errors')}")
+        return body
+
+    # Retries exhausted on network errors.
+    raise last_exc if last_exc else RuntimeError(f"{method} {path}: retries exhausted")
+
+
+def _cf_get(path: str) -> Any:
+    return _cf_request("GET", path)
 
 
 def _cf_post(path: str, payload: dict) -> Any:
-    """POST to the Cloudflare v4 API, raise on HTTP or API errors."""
-    url = f"{CF_API_BASE}{path}"
-    resp = requests.post(url, headers=_cf_headers(), json=payload, timeout=30)
-    _cf_raise(resp, "POST", path)
-    body = resp.json()
-    if not body.get("success"):
-        raise RuntimeError(f"API error for POST {path}: {body.get('errors')}")
-    return body
+    return _cf_request("POST", path, payload)
 
 
 def _cf_put(path: str, payload: dict) -> Any:
-    """PUT to the Cloudflare v4 API, raise on HTTP or API errors."""
-    url = f"{CF_API_BASE}{path}"
-    resp = requests.put(url, headers=_cf_headers(), json=payload, timeout=30)
-    _cf_raise(resp, "PUT", path)
-    body = resp.json()
-    if not body.get("success"):
-        raise RuntimeError(f"API error for PUT {path}: {body.get('errors')}")
-    return body
+    return _cf_request("PUT", path, payload)
 
 
 # ---------------------------------------------------------------------------
 # Setup: queue
 # ---------------------------------------------------------------------------
 
+def find_queue_id(name: str) -> str | None:
+    """Return the queue_id for name by paginating /queues, or None if absent."""
+    page = 1
+    while True:
+        body = _cf_get(f"/accounts/{ACCOUNT_ID}/queues?page={page}&per_page=100")
+        for q in (body.get("result") or []):
+            if q["queue_name"] == name:
+                return q["queue_id"]
+        info = body.get("result_info", {})
+        if page >= info.get("total_pages", 1):
+            return None
+        page += 1
+
+
 def ensure_queue() -> str:
     """Return the queue_id for QUEUE_NAME, creating the queue if absent."""
     print(f"[setup] checking for queue '{QUEUE_NAME}' ...", file=sys.stderr)
 
-    # Paginate through all queues to find a matching name.
-    page = 1
-    while True:
-        body = _cf_get(f"/accounts/{ACCOUNT_ID}/queues?page={page}&per_page=100")
-        queues = body.get("result") or []
-        for q in queues:
-            if q["queue_name"] == QUEUE_NAME:
-                queue_id = q["queue_id"]
-                print(f"[setup] found existing queue id={queue_id}", file=sys.stderr)
-                return queue_id
-        info = body.get("result_info", {})
-        if page >= info.get("total_pages", 1):
-            break
-        page += 1
+    queue_id = find_queue_id(QUEUE_NAME)
+    if queue_id:
+        print(f"[setup] found existing queue id={queue_id}", file=sys.stderr)
+        return queue_id
 
     # Queue does not exist — create it.
     print(f"[setup] creating queue '{QUEUE_NAME}' ...", file=sys.stderr)
@@ -172,7 +223,14 @@ def ensure_http_pull_consumer(queue_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def ensure_notification_rules(queue_id: str) -> None:
-    """Create or update the R2 event notification rule for object-create events."""
+    """Ensure an unfiltered object-create notification rule exists on this bucket→queue.
+
+    The R2 configuration PUT replaces the entire rule set for a bucket→queue
+    pair, so we fetch existing rules first and only add a rule when no
+    existing *unfiltered* rule already covers the required actions.  Rules
+    scoped with a prefix/suffix don't count — we want object-create events
+    for every key in the bucket.
+    """
     print("[setup] checking R2 notification rules ...", file=sys.stderr)
 
     # Retrieve existing rules for this bucket + queue pair.
@@ -188,28 +246,36 @@ def ensure_notification_rules(queue_id: str) -> None:
         else:
             raise
 
-    # Check whether ALL required actions are already covered by at least one rule.
-    covered = set()
+    required = set(OBJECT_CREATE_ACTIONS)
     for rule in rules:
-        covered.update(rule.get("actions", []))
+        # Only unfiltered rules (no prefix/suffix) count as full coverage.
+        if rule.get("prefix") or rule.get("suffix"):
+            continue
+        if required.issubset(set(rule.get("actions", []))):
+            print(
+                "[setup] notification rules already cover all object-create actions",
+                file=sys.stderr,
+            )
+            return
 
-    missing = set(OBJECT_CREATE_ACTIONS) - covered
-    if not missing:
-        print("[setup] notification rules already cover all object-create actions", file=sys.stderr)
-        return
-
-    print(f"[setup] configuring notification rules (missing: {missing}) ...", file=sys.stderr)
+    # Add our rule alongside any existing rules rather than replacing them.
+    new_rule = {
+        "actions": OBJECT_CREATE_ACTIONS,
+        "description": "Notify on new object creation",
+    }
+    preserved_rules = [
+        {k: v for k, v in r.items() if k in ("actions", "prefix", "suffix", "description")}
+        for r in rules
+    ]
+    print(
+        f"[setup] configuring notification rules "
+        f"(preserving {len(preserved_rules)} existing rule(s)) ...",
+        file=sys.stderr,
+    )
     _cf_put(
         f"/accounts/{ACCOUNT_ID}/event_notifications/r2/{BUCKET_NAME}"
         f"/configuration/queues/{queue_id}",
-        {
-            "rules": [
-                {
-                    "actions": OBJECT_CREATE_ACTIONS,
-                    "description": "Notify on new object creation",
-                }
-            ]
-        },
+        {"rules": preserved_rules + [new_rule]},
     )
     print("[setup] notification rules configured", file=sys.stderr)
 
@@ -235,23 +301,39 @@ def make_r2_client():
     )
 
 
-def download_object(r2: Any, bucket: str, key: str) -> bytes:
-    """Fetch raw bytes for key from R2, transparently decompressing gzip.
+def stream_object_to_stdout(r2: Any, bucket: str, key: str) -> int:
+    """Stream key from R2 to stdout, transparently decompressing gzip.
 
-    For gzip-compressed objects (key ends with .gz or Content-Encoding is
-    gzip), the stored compressed bytes are decompressed before returning so
-    that stdout always receives plain text / uncompressed content.
+    Streams in chunks so multi-GB objects don't blow memory.  Returns the
+    number of uncompressed bytes written.
     """
     resp = r2.get_object(Bucket=bucket, Key=key)
-    body_bytes = resp["Body"].read()
-
+    body = resp["Body"]
     content_encoding = resp.get("ContentEncoding", "")
-    # Decompress if the object is gzip-encoded (either by Content-Encoding or
-    # by file extension convention).
-    if content_encoding == "gzip" or key.endswith(".gz"):
-        body_bytes = gzip.decompress(body_bytes)
+    is_gzip = content_encoding == "gzip" or key.endswith(".gz")
 
-    return body_bytes
+    out = sys.stdout.buffer
+    total = 0
+    chunk_size = 1 << 20  # 1 MiB
+
+    if is_gzip:
+        with gzip.GzipFile(fileobj=body, mode="rb") as gz:
+            while True:
+                chunk = gz.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                total += len(chunk)
+    else:
+        while True:
+            chunk = body.read(chunk_size)
+            if not chunk:
+                break
+            out.write(chunk)
+            total += len(chunk)
+
+    out.flush()
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -296,12 +378,20 @@ def pull_and_list(queue_id: str) -> int:
         lease_id = msg["lease_id"]
         raw_body = msg["body"]
 
-        # Queues encodes messages with content-type "json" or "bytes" as
-        # base64 to allow safe transport inside the JSON response envelope.
-        # Attempt base64 decode; if it fails the body is plain text/JSON.
-        try:
-            decoded = base64.b64decode(raw_body).decode("utf-8")
-        except Exception:
+        # Queues reports the body's content-type in metadata.  "json" and
+        # "text" are delivered verbatim; "bytes" is base64-encoded for safe
+        # transport inside the JSON envelope.  Fall back to parsing as JSON
+        # directly when no metadata is present.
+        metadata = msg.get("metadata") or {}
+        content_type = (metadata.get("content-type") or metadata.get("contentType") or "").lower()
+
+        if content_type == "bytes":
+            try:
+                decoded = base64.b64decode(raw_body).decode("utf-8")
+            except Exception as exc:
+                print(f"[pull] WARN: base64 decode failed ({exc}); skipping", file=sys.stderr)
+                continue
+        else:
             decoded = raw_body
 
         try:
@@ -355,14 +445,11 @@ def fetch_and_ack(record: dict) -> None:
     print(f"[fetch] downloading s3://{bucket}/{key} ...", file=sys.stderr)
 
     r2 = make_r2_client()
-    data = download_object(r2, bucket, key)
+    # Stream directly to stdout — avoids buffering the whole object in memory
+    # so multi-GB downloads don't OOM.  Diagnostic output goes to stderr.
+    total = stream_object_to_stdout(r2, bucket, key)
 
-    # Write raw bytes to stdout — stderr carries all diagnostic output so the
-    # two streams never mix when stdout is redirected or piped.
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
-
-    print(f"[fetch] wrote {len(data)} bytes; acknowledging queue entry ...", file=sys.stderr)
+    print(f"[fetch] wrote {total} bytes; acknowledging queue entry ...", file=sys.stderr)
 
     # Ack only after a successful write — this removes the notification entry
     # from the queue permanently so no other worker re-processes it.
@@ -526,6 +613,10 @@ def main() -> None:
 
     validate_config()
 
+    # Compute the queue name default now that BUCKET_NAME has been validated.
+    global QUEUE_NAME
+    QUEUE_NAME = os.environ.get("QUEUE_NAME") or f"{BUCKET_NAME}-notifications"
+
     # CRIBL_COLLECT_ARG env var acts as an implicit RECORD argument, allowing
     # the script to be driven in fetch mode by a Cribl collector without
     # requiring explicit CLI construction.
@@ -561,23 +652,11 @@ def main() -> None:
     else:
         # Without setup we still need the queue_id — look it up by name.
         print(f"[init] resolving queue id for '{QUEUE_NAME}' ...", file=sys.stderr)
-        page = 1
-        queue_id = ""
-        while True:
-            body = _cf_get(f"/accounts/{ACCOUNT_ID}/queues?page={page}&per_page=100")
-            for q in (body.get("result") or []):
-                if q["queue_name"] == QUEUE_NAME:
-                    queue_id = q["queue_id"]
-                    break
-            if queue_id:
-                break
-            info = body.get("result_info", {})
-            if page >= info.get("total_pages", 1):
-                break
-            page += 1
-        if not queue_id:
+        resolved = find_queue_id(QUEUE_NAME)
+        if not resolved:
             print(f"ERROR: queue '{QUEUE_NAME}' not found.  Run without --no-setup first.", file=sys.stderr)
             sys.exit(1)
+        queue_id = resolved
         print(f"[init] queue id={queue_id}", file=sys.stderr)
 
     if args.setup_only:
